@@ -23,6 +23,16 @@ from homelens.utils import json_default
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 FRONTEND_DIST = PROJECT_ROOT / "map" / "dist"
 MAX_REQUEST_BYTES = 128 * 1024
+LOCAL_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _local_origin_allowed(origin: str, request_host: str) -> bool:
+    parsed_origin = urlparse(origin)
+    if parsed_origin.scheme not in {"http", "https"}:
+        return False
+    origin_host = (parsed_origin.hostname or "").lower()
+    host_name = (request_host.rsplit("@", 1)[-1].split(":", 1)[0] or "").lower()
+    return origin_host in LOCAL_ORIGIN_HOSTS and host_name in LOCAL_ORIGIN_HOSTS
 
 
 def handler_factory(service: HomeLensService) -> type[BaseHTTPRequestHandler]:
@@ -107,6 +117,10 @@ def handler_factory(service: HomeLensService) -> type[BaseHTTPRequestHandler]:
                     parameters = parse_qs(parsed.query)
                     session_id = (parameters.get("session_id") or [""])[0]
                     self._json(HTTPStatus.OK, service.advisor_state(session_id))
+                elif path == "/api/agent/session":
+                    parameters = parse_qs(parsed.query)
+                    session_id = (parameters.get("session_id") or [""])[0]
+                    self._json(HTTPStatus.OK, service.agent_state(session_id))
                 elif path.startswith("/api/"):
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                 else:
@@ -124,7 +138,13 @@ def handler_factory(service: HomeLensService) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
-            if path not in {"/api/recommend", "/api/advisor/message", "/api/advisor/reset"}:
+            if path not in {
+                "/api/recommend",
+                "/api/advisor/message",
+                "/api/advisor/reset",
+                "/api/agent/message",
+                "/api/agent/reset",
+            }:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                 return
             if self.headers.get_content_type() != "application/json":
@@ -138,12 +158,8 @@ def handler_factory(service: HomeLensService) -> type[BaseHTTPRequestHandler]:
                 return
             origin = self.headers.get("Origin")
             if origin:
-                parsed_origin = urlparse(origin)
                 request_host = self.headers.get("Host", "").lower()
-                if (
-                    parsed_origin.scheme not in {"http", "https"}
-                    or parsed_origin.netloc.lower() != request_host
-                ):
+                if not _local_origin_allowed(origin, request_host):
                     self._json(
                         HTTPStatus.FORBIDDEN,
                         {"error": "forbidden_origin", "message": "Cross-origin requests are blocked."},
@@ -177,8 +193,12 @@ def handler_factory(service: HomeLensService) -> type[BaseHTTPRequestHandler]:
                     result = service.get_recommendations(payload)
                 elif path == "/api/advisor/message":
                     result = service.advisor_message(payload)
-                else:
+                elif path == "/api/advisor/reset":
                     result = service.reset_advisor(payload)
+                elif path == "/api/agent/message":
+                    result = service.agent_message(payload)
+                else:
+                    result = service.reset_agent(payload)
                 self._json(HTTPStatus.OK, result)
             except (ValueError, json.JSONDecodeError) as error:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "message": str(error)})

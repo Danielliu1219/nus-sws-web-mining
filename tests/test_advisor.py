@@ -51,6 +51,32 @@ class FakeLocationResolver:
         ][:limit]
 
 
+class RewriteLocationResolver:
+    index = FakeLocationIndex()
+
+    def __init__(self):
+        self.queries = []
+
+    def search(self, query, *, limit=5):
+        self.queries.append(query)
+        if query != "University Town":
+            return []
+        return [
+            {
+                "id": "onemap:utown",
+                "provider": "onemap",
+                "name": "UNIVERSITY TOWN",
+                "address": "2 College Avenue East",
+                "postal_code": "138612",
+                "latitude": 1.3083,
+                "longitude": 103.7730,
+                "confidence": 1.0,
+                "planning_area": "QUEENSTOWN",
+                "subzone": "DOVER",
+            }
+        ][:limit]
+
+
 class FakeResponse:
     def __init__(self, payload, status_code=200):
         self.payload = payload
@@ -70,7 +96,9 @@ class FakeResponse:
 
 def blank_model_updates():
     values = {
-        key: [] if key in {"preferred_towns", "additional_needs"} else None
+        key: []
+        if key in {"preferred_towns", "additional_needs", "hdb_flat_types", "bedroom_options"}
+        else None
         for key in OpenAIAdvisorClient._schema()["properties"]["profile_updates"]["required"]
     }
     values["location_intent"] = {
@@ -87,6 +115,9 @@ def blank_model_updates():
 
 class FakeSemanticAdvisorClient:
     available = True
+
+    def rewrite_location_queries(self, location_text, profile, attempted_queries):
+        return ["University Town"] if "NUS University Town" in attempted_queries else []
 
     def respond(self, message, profile, turns, local_evidence):
         updates = blank_model_updates()
@@ -108,6 +139,19 @@ class FakeSemanticAdvisorClient:
         return {
             "answer": "我已经理解你的需求。",
             "profile_updates": updates,
+            "recommendation_requested": False,
+            "sources": [],
+            "method": "openai",
+        }
+
+
+class MissingRoomAdvisorClient:
+    available = True
+
+    def respond(self, message, profile, turns, local_evidence):
+        return {
+            "answer": "Noted — I recorded your room preference.",
+            "profile_updates": blank_model_updates(),
             "recommendation_requested": False,
             "sources": [],
             "method": "openai",
@@ -208,6 +252,97 @@ class AdvisorTests(unittest.TestCase):
         )
         self.assertEqual(result["profile"]["institution"], "NUS")
         self.assertIsNone(result["profile"]["school_need"])
+
+    def test_room_options_can_complete_room_profile(self) -> None:
+        profile = HousingProfile(housing_mode="rent")
+        profile.merge({"bedroom_options": [3, 4], "rental_scope": "whole_unit"})
+        progress = self.service._advisor_service()._profile_progress(profile)
+        self.assertTrue(progress["checks"]["rooms"])
+        self.assertEqual(profile.bedroom_options, [3, 4])
+
+    def test_hdb_flat_type_aliases_are_normalised(self) -> None:
+        for alias in ("3 ROOM", "3-room", "3 rooms", "3-room HDB", "HDB 3 room flat"):
+            with self.subTest(alias=alias):
+                profile = HousingProfile(housing_mode="buy")
+                profile.merge({"hdb_flat_type": alias})
+                self.assertEqual(profile.hdb_flat_type, "3 ROOM")
+                self.assertEqual(profile.hdb_flat_types, ["3 ROOM"])
+        invalid = HousingProfile(housing_mode="buy")
+        invalid.merge({"hdb_flat_type": "6-room"})
+        self.assertIsNone(invalid.hdb_flat_type)
+
+    def test_openai_schema_constrains_hdb_flat_types(self) -> None:
+        properties = OpenAIAdvisorClient._schema()["properties"]["profile_updates"][
+            "properties"
+        ]
+        single = properties["hdb_flat_type"]["anyOf"][0]["enum"]
+        multiple = properties["hdb_flat_types"]["items"]["enum"]
+        self.assertEqual(single, multiple)
+        self.assertIn("3 ROOM", single)
+        self.assertNotIn("3-room HDB", single)
+
+    def test_missing_ai_room_update_uses_narrow_buying_fallback(self) -> None:
+        advisor = self.service._advisor_service()
+        advisor.client = MissingRoomAdvisorClient()
+        session = advisor.sessions.get(None)
+        session.profile = HousingProfile(
+            housing_mode="buy",
+            preferred_towns=["QUEENSTOWN"],
+            max_budget=650_000,
+            needs_discussed=True,
+        )
+
+        result = self.service.advisor_message(
+            {"session_id": session.session_id, "message": "3 rooms"}
+        )
+
+        self.assertEqual(result["profile"]["hdb_flat_type"], "3 ROOM")
+        self.assertEqual(result["profile"]["hdb_flat_types"], ["3 ROOM"])
+        self.assertTrue(result["progress"]["checks"]["rooms"])
+        self.assertNotIn("What room setup do you need?", result["reply"])
+
+    def test_buying_bedroom_wording_is_not_mistaken_for_hdb_room_type(self) -> None:
+        advisor = self.service._advisor_service()
+        advisor.client = MissingRoomAdvisorClient()
+        session = advisor.sessions.get(None)
+        session.profile = HousingProfile(housing_mode="buy")
+
+        result = self.service.advisor_message(
+            {"session_id": session.session_id, "message": "I need 3 bedrooms"}
+        )
+
+        self.assertIsNone(result["profile"]["hdb_flat_type"])
+        self.assertEqual(result["profile"]["bedrooms"], 3)
+        self.assertEqual(result["profile"]["bedroom_options"], [3])
+
+    def test_room_preference_can_be_flexible(self) -> None:
+        profile = HousingProfile(housing_mode="buy")
+        profile.merge({"room_preference_flexible": True})
+        progress = self.service._advisor_service()._profile_progress(profile)
+        self.assertTrue(progress["checks"]["rooms"])
+
+    def test_budget_can_be_flexible(self) -> None:
+        profile = HousingProfile(housing_mode="rent")
+        profile.merge({"budget_flexible": True})
+        progress = self.service._advisor_service()._profile_progress(profile)
+        self.assertTrue(progress["checks"]["maximum_budget"])
+
+    def test_empty_onemap_result_can_use_model_query_rewrite(self) -> None:
+        advisor = self.service._advisor_service()
+        advisor.client = FakeSemanticAdvisorClient()
+        resolver = RewriteLocationResolver()
+        self.service._location_resolver = resolver
+        profile = HousingProfile(
+            location_query="NUS University Town",
+            location_raw="NUS University Town",
+        )
+
+        candidates = advisor._resolve_location_candidates(profile)
+
+        self.assertEqual(resolver.queries, ["NUS University Town", "University Town"])
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["name"], "UNIVERSITY TOWN")
+        self.assertEqual(profile.location_query, "University Town")
 
     def test_location_confirmation_finishes_the_previous_price_answer(self) -> None:
         first = self.service.advisor_message(

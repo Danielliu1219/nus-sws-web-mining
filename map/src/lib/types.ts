@@ -36,6 +36,8 @@ export interface SingaporeMapProps {
   subzoneScores?: Record<string, SubzoneProfile>;
   maxListingMarkers?: number;
   anchorLocation?: LocationAnchor | null;
+  focusedListingId?: string | null;
+  onFocusedListingClose?: () => void;
 }
 
 export interface RentalListing {
@@ -49,17 +51,34 @@ export interface RentalListing {
 export type ListingLabelMap = Record<string, string>;
 
 export interface DimensionProfile { score: number | null; places: number; reviews: number; }
+export interface FacilityCounts {
+  railwayStations: number;
+  busStops: number;
+  malls: number;
+  supermarkets: number;
+  convenienceStores: number;
+  foodCourts: number;
+  restaurants: number;
+  cafes: number;
+  parks: number;
+  natureReserves: number;
+  sportsCentres: number;
+  schools: number;
+  kindergartens: number;
+}
 export interface SubzoneProfile {
   name: string;
   planningArea: string;
   liveabilityScore: number | null;
   dimensions: Record<string, DimensionProfile>;
+  facilityCounts?: FacilityCounts;
 }
 
 export interface RegionProfile {
   name: string;
   liveabilityScore: number | null;
   dimensions: Record<string, DimensionProfile>;
+  facilityCounts?: FacilityCounts;
   subzoneCount: number;
   placeEvidence: number;
   reviewEvidence: number;

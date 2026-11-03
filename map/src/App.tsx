@@ -1,18 +1,51 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { CSSProperties, FormEvent } from 'react';
+import type { FormEvent } from 'react';
 import { SingaporeMap } from './components/singapore-map';
+import { RedditScorePanel } from './components/singapore-map/RedditScorePanel';
+import type { RedditAreaNlp } from './components/singapore-map/RedditScorePanel';
 import { AdvisorView } from './components/advisor/AdvisorView';
+import type { AdvisorRecommendations, AgentCard } from './components/advisor/AdvisorView';
 import type {
+  FacilityCounts,
   LocationAnchor,
   RegionProfile,
   RentalListing,
   SelectedRegion,
   SubzoneProfile,
 } from './lib/types';
+import type { DisplayComment } from './lib/display-comments';
+import { parseCommentPool, pickRegionComments } from './lib/display-comments';
 import './App.css';
 
-type View = 'explore' | 'advisor' | 'recommend' | 'listings' | 'method';
+type View = 'explore' | 'recommend' | 'listings' | 'method';
 type ListingMode = 'sale' | 'rent';
+
+const ONBOARDING_STEPS = [
+  {
+    label: 'Map',
+    target: '[data-tour="map"]',
+    title: 'Start with the map',
+    body: 'Click a planning area to inspect it. The map will also show HDB listing dots for the selected area.',
+  },
+  {
+    label: 'Area panel',
+    target: '[data-tour="area-panel"]',
+    title: 'Read the area summary',
+    body: 'The right panel shows facility totals, market context, and the current sale or rental listings in that area.',
+  },
+  {
+    label: 'Listings',
+    target: '[data-tour="area-panel"]',
+    title: 'Click a listing to locate it',
+    body: 'Selecting a listing focuses the map on that exact home. Close the detail panel to return to all area listings.',
+  },
+  {
+    label: 'AI advisor',
+    target: '[data-tour="advisor"]',
+    title: 'Ask the AI housing advisor',
+    body: 'Use Ask advisor when you want a guided shortlist instead of manually comparing every area and listing.',
+  },
+] as const;
 
 interface ProductStatus {
   generatedAt: string;
@@ -131,6 +164,24 @@ const DIMENSIONS = [
   ['recreation', 'Recreation'],
 ] as const;
 
+const FACILITY_GROUPS = [
+  { label: 'Transit', items: [['MRT stations', 'railwayStations'], ['Bus stops', 'busStops']] },
+  { label: 'Food', items: [['Food courts', 'foodCourts'], ['Restaurants', 'restaurants'], ['Cafes', 'cafes']] },
+  { label: 'Shopping', items: [['Malls', 'malls'], ['Supermarkets', 'supermarkets'], ['Convenience', 'convenienceStores']] },
+  { label: 'Education', items: [['Schools', 'schools'], ['Kindergartens', 'kindergartens']] },
+  { label: 'Nature', items: [['Parks', 'parks'], ['Nature reserves', 'natureReserves']] },
+  { label: 'Recreation', items: [['Sports centres', 'sportsCentres']] },
+] as const;
+
+function facilityValue(counts: FacilityCounts | undefined, key: keyof FacilityCounts) {
+  return counts?.[key] ?? 0;
+}
+
+function totalFacilities(counts: FacilityCounts | undefined) {
+  if (!counts) return 0;
+  return Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
 const money = new Intl.NumberFormat('en-SG', {
   style: 'currency',
   currency: 'SGD',
@@ -171,40 +222,161 @@ function distanceMeters(aLat: number, aLng: number, bLat: number, bLng: number) 
   return 6_371_000 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
 }
 
-function ScoreRing({ score, size = 'large' }: { score?: number | null; size?: 'small' | 'large' }) {
-  const value = Math.round(score ?? 0);
+function CompactFacilitySummary({ profile }: { profile: RegionProfile | SubzoneProfile }) {
+  const counts = profile.facilityCounts;
   return (
-    <div
-      className={`score-ring score-ring--${size}`}
-      style={{ '--score-angle': `${value * 3.6}deg` } as CSSProperties}
-      aria-label={score == null ? 'Score unavailable' : `Liveability score ${value} out of 100`}
-    >
-      <span>{score == null ? '—' : value}</span>
-      {size === 'large' && <small>LIVEABILITY</small>}
-    </div>
-  );
-}
-
-function DimensionBars({ profile }: { profile: RegionProfile | SubzoneProfile }) {
-  return (
-    <div className="dimension-list">
-      {DIMENSIONS.map(([key, label]) => {
-        const item = profile.dimensions[key];
-        const score = item?.score ?? 0;
+    <div className="facility-summary">
+      {FACILITY_GROUPS.map((group) => {
+        const total = group.items.reduce(
+          (sum, [, key]) => sum + facilityValue(counts, key),
+          0,
+        );
         return (
-          <div className="dimension-row" key={key}>
-            <span>{label}</span>
-            <div className="dimension-track"><i style={{ width: `${score}%` }} /></div>
-            <b>{item?.score == null ? '—' : Math.round(item.score)}</b>
-          </div>
+          <article key={group.label}>
+            <span>{group.label}</span>
+            <b>{compact.format(total)}</b>
+          </article>
         );
       })}
     </div>
   );
 }
 
+function commentExcerpt(comment: DisplayComment) {
+  const value = (comment.evidence_span || comment.text || '').trim();
+  return value.length > 180 ? `${value.slice(0, 177)}...` : value;
+}
+
+function RegionComments({ comments, region, className = '' }: { comments: DisplayComment[]; region: SelectedRegion; className?: string }) {
+  const sourceLabel = region.type === 'planning' ? 'Reddit' : 'Google';
+  return (
+    <section className={`region-comments ${className}`} aria-label={`${sourceLabel} community comments`}>
+      <div className="region-comments__head">
+        <span>{sourceLabel} comments</span>
+      </div>
+      {comments.length ? (
+        <div className="region-comments__list">
+          {comments.map((comment) => {
+            const content = commentExcerpt(comment);
+            const meta = comment.google_category || comment.aspects?.slice(0, 2).join(' / ') || comment.sentiment || sourceLabel;
+            return (
+              <article className="region-comment" key={comment.comment_id}>
+                <p>&ldquo;{content}&rdquo;</p>
+                <footer>
+                  <span>{meta}</span>
+                  {comment.permalink && <a href={comment.permalink} target="_blank" rel="noreferrer">Source</a>}
+                </footer>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="region-comments__empty">No matched {sourceLabel.toLowerCase()} comments are available for this area yet.</p>
+      )}
+    </section>
+  );
+}
+
+function OnboardingTour({
+  step,
+  onStepChange,
+  onClose,
+}: {
+  step: number;
+  onStepChange: (value: number) => void;
+  onClose: () => void;
+}) {
+  const current = ONBOARDING_STEPS[step];
+  const last = step === ONBOARDING_STEPS.length - 1;
+  const [targetRect, setTargetRect] = useState<DOMRect | null>(null);
+
+  useEffect(() => {
+    let frame = 0;
+    const updateTarget = () => {
+      const target = document.querySelector(current.target);
+      if (!target) {
+        setTargetRect(null);
+        return;
+      }
+      target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+      frame = window.setTimeout(() => {
+        setTargetRect(target.getBoundingClientRect());
+      }, 260);
+    };
+    updateTarget();
+    window.addEventListener('resize', updateTarget);
+    window.addEventListener('scroll', updateTarget, true);
+    return () => {
+      window.clearTimeout(frame);
+      window.removeEventListener('resize', updateTarget);
+      window.removeEventListener('scroll', updateTarget, true);
+    };
+  }, [current.target]);
+
+  const cardStyle = useMemo(() => {
+    if (!targetRect) return undefined;
+    const cardWidth = 360;
+    const gap = 16;
+    const canPlaceRight = targetRect.right + cardWidth + gap < window.innerWidth;
+    const canPlaceLeft = targetRect.left - cardWidth - gap > 0;
+    const left = canPlaceRight
+      ? targetRect.right + gap
+      : canPlaceLeft
+        ? targetRect.left - cardWidth - gap
+        : Math.min(Math.max(16, targetRect.left), window.innerWidth - cardWidth - 16);
+    const top = Math.min(Math.max(16, targetRect.top), window.innerHeight - 300);
+    return { left, top } as const;
+  }, [targetRect]);
+
+  return (
+    <div className="onboarding onboarding--spotlight" role="dialog" aria-modal="true" aria-label="New user guide">
+      <div className="onboarding__shade" onClick={onClose} />
+      {targetRect && (
+        <div
+          className="onboarding__spotlight"
+          style={{
+            left: targetRect.left - 8,
+            top: targetRect.top - 8,
+            width: targetRect.width + 16,
+            height: targetRect.height + 16,
+          }}
+        />
+      )}
+      <section className="onboarding__card onboarding__card--spotlight" style={cardStyle}>
+        <button className="onboarding__close" type="button" onClick={onClose} aria-label="Close guide">x</button>
+        <p className="overline">QUICK GUIDE</p>
+        <div className="onboarding__progress">
+          {ONBOARDING_STEPS.map((item, index) => (
+            <button
+              key={item.label}
+              className={index === step ? 'active' : ''}
+              type="button"
+              onClick={() => onStepChange(index)}
+              aria-label={`Show ${item.label} guide`}
+            />
+          ))}
+        </div>
+        <span className="onboarding__label">{current.label}</span>
+        <h2>{current.title}</h2>
+        <p>{current.body}</p>
+        <div className="onboarding__actions">
+          <button type="button" onClick={onClose}>Skip</button>
+          <div>
+            <button type="button" disabled={step === 0} onClick={() => onStepChange(Math.max(0, step - 1))}>Back</button>
+            <button type="button" onClick={() => last ? onClose() : onStepChange(step + 1)}>
+              {last ? 'Start exploring' : 'Next'}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function App() {
   const [view, setView] = useState<View>('explore');
+  const [showOnboarding, setShowOnboarding] = useState(true);
+  const [onboardingStep, setOnboardingStep] = useState(0);
   const [health, setHealth] = useState<Health | null>(null);
   const [status, setStatus] = useState<ProductStatus | null>(null);
   const [regions, setRegions] = useState<Record<string, RegionProfile>>({});
@@ -214,6 +386,12 @@ function App() {
   const [selectedRegion, setSelectedRegion] = useState<SelectedRegion | null>(null);
   const [mapListingMode, setMapListingMode] = useState<'none' | ListingMode>('none');
   const [anchorLocation, setAnchorLocation] = useState<LocationAnchor | null>(null);
+  const [advisorOpen, setAdvisorOpen] = useState(false);
+  const [advisorRecommendations, setAdvisorRecommendations] = useState<AdvisorRecommendations | null>(null);
+  const [advisorMapListingIds, setAdvisorMapListingIds] = useState<string[] | null>(null);
+  const [focusedListingId, setFocusedListingId] = useState<string | null>(null);
+  const [commentPool, setCommentPool] = useState<DisplayComment[]>([]);
+  const [redditAreaScores, setRedditAreaScores] = useState<RedditAreaNlp | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -252,6 +430,22 @@ function App() {
       } catch {
         if (!cancelled) setHealth(null);
       }
+      try {
+        const response = await fetch('/display-comment-pool.jsonl');
+        if (response.ok && !cancelled) {
+          setCommentPool(parseCommentPool(await response.text()));
+        }
+      } catch {
+        if (!cancelled) setCommentPool([]);
+      }
+      try {
+        const response = await fetch('/area_reddit_nlp.json');
+        if (response.ok && !cancelled) {
+          setRedditAreaScores(await response.json());
+        }
+      } catch {
+        if (!cancelled) setRedditAreaScores(null);
+      }
     }
     load();
     return () => { cancelled = true; };
@@ -273,9 +467,50 @@ function App() {
       : subzones[selectedRegion.id];
   }, [selectedRegion, regions, subzones]);
 
+  const selectedComments = useMemo(
+    () => pickRegionComments(commentPool, selectedRegion),
+    [commentPool, selectedRegion],
+  );
+
+  useEffect(() => {
+    if (!advisorRecommendations) {
+      setAdvisorMapListingIds(null);
+      setFocusedListingId(null);
+      return;
+    }
+    const listingIds = advisorRecommendations.listings.map((listing) => listing.id).filter(Boolean);
+    setAdvisorMapListingIds(listingIds.length ? listingIds : null);
+    setMapListingMode(advisorRecommendations.mode === 'buy' ? 'sale' : 'rent');
+    setSelectedRegion(null);
+    if (listingIds.length) {
+      setFocusedListingId(null);
+      setView('explore');
+      window.setTimeout(() => {
+        document.querySelector('#explore-map')?.scrollIntoView({ behavior: 'smooth' });
+      }, 0);
+    }
+  }, [advisorRecommendations]);
+
+  const focusAdvisorListing = (card: AgentCard, peerCards: AgentCard[]) => {
+    if (card.kind !== 'listing' || !card.id || !card.mode) return;
+    const peerIds = peerCards
+      .filter((item) => item.kind === 'listing' && item.mode === card.mode && item.id)
+      .map((item) => item.id);
+    setAdvisorMapListingIds(peerIds.length ? peerIds : [card.id]);
+    setFocusedListingId(card.id);
+    setMapListingMode(card.mode);
+    setSelectedRegion(null);
+    setView('explore');
+    window.setTimeout(() => {
+      document.querySelector('#explore-map')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 0);
+  };
+
   const mapFilter = useMemo(() => {
+    const advisorIdSet = advisorMapListingIds ? new Set(advisorMapListingIds) : null;
     return (listing: RentalListing) => {
       if (mapListingMode === 'none' || listing.mode !== mapListingMode) return false;
+      if (advisorIdSet && !advisorIdSet.has(listing.id)) return false;
       if (selectedRegion) {
         if (selectedRegion.type === 'planning' && listing.planningArea !== selectedRegion.id) return false;
         if (selectedRegion.type === 'subzone' && listing.subzone !== selectedRegion.id) return false;
@@ -291,13 +526,11 @@ function App() {
       }
       return true;
     };
-  }, [anchorLocation, mapListingMode, selectedRegion]);
+  }, [advisorMapListingIds, anchorLocation, mapListingMode, selectedRegion]);
 
-  const chooseAreaForSearch = () => {
-    setView('recommend');
-    window.setTimeout(() => {
-      document.querySelector('#recommendation')?.scrollIntoView({ behavior: 'smooth' });
-    }, 0);
+  const closeOnboarding = () => {
+    setShowOnboarding(false);
+    setOnboardingStep(0);
   };
 
   return (
@@ -310,7 +543,6 @@ function App() {
         <nav aria-label="Primary navigation">
           {([
             ['explore', 'Explore'],
-            ['advisor', 'AI advisor'],
             ['recommend', 'Find a home'],
             ['listings', 'Live listings'],
             ['method', 'How it works'],
@@ -318,8 +550,11 @@ function App() {
             <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{label}</button>
           ))}
         </nav>
-        <div className={`system-pill ${health?.status === 'ready' ? 'ready' : ''}`}>
-          <i /> {health?.status === 'ready' ? 'Knowledge base ready' : 'Local data mode'}
+        <div className="header-tools">
+          <button className="guide-button" type="button" onClick={() => { setOnboardingStep(0); setShowOnboarding(true); }}>Guide</button>
+          <div className={`system-pill ${health?.status === 'ready' ? 'ready' : ''}`}>
+            <i /> {health?.status === 'ready' ? 'Knowledge base ready' : 'Local data mode'}
+          </div>
         </div>
       </header>
 
@@ -332,32 +567,26 @@ function App() {
             regions={regions}
             selectedRegion={selectedRegion}
             selectedProfile={selectedProfile}
+            selectedComments={selectedComments}
+            listings={listings}
+            redditAreaScores={redditAreaScores}
             setSelectedRegion={setSelectedRegion}
             mapListingMode={mapListingMode}
             setMapListingMode={setMapListingMode}
+            advisorMapListingIds={advisorMapListingIds}
+            clearAdvisorMapListings={() => setAdvisorMapListingIds(null)}
             regionScores={regionScores}
             subzones={subzones}
             mapFilter={mapFilter}
-            chooseAreaForSearch={chooseAreaForSearch}
             goRecommend={() => setView('recommend')}
-            goAdvisor={() => setView('advisor')}
+            goAdvisor={() => setAdvisorOpen(true)}
             anchorLocation={anchorLocation}
-          />
-        )}
-        {view === 'advisor' && (
-          <AdvisorView
-            available={Boolean(health?.integrations?.openai)}
-            onAnchorChange={setAnchorLocation}
-            onShowMap={(mode) => {
-              setMapListingMode(mode);
-              setSelectedRegion(null);
-              setView('explore');
-            }}
+            focusedListingId={focusedListingId}
+            setFocusedListingId={setFocusedListingId}
           />
         )}
         {view === 'recommend' && (
           <RecommendationView
-            health={health}
             initialArea={selectedRegion?.type === 'planning' ? selectedRegion.id : selectedRegion?.parentId}
             anchorLocation={anchorLocation}
             setAnchorLocation={setAnchorLocation}
@@ -368,10 +597,40 @@ function App() {
         {view === 'method' && <MethodView status={status} />}
       </main>
 
+      <div className={`advisor-widget ${advisorOpen ? 'advisor-widget--open' : ''}`} data-tour="advisor">
+        {!advisorOpen && (
+          <button className="advisor-widget__launcher" type="button" onClick={() => setAdvisorOpen(true)}>
+            <span className="advisor-orb"><i /></span>
+            <span><b>Ask advisor</b><small>Get guided housing picks</small></span>
+          </button>
+        )}
+        {advisorOpen && (
+          <div className="advisor-widget__panel" role="dialog" aria-label="HomeRadar advisor">
+            <AdvisorView
+              available={Boolean(health?.integrations?.openai)}
+              variant="widget"
+              onClose={() => setAdvisorOpen(false)}
+              onAnchorChange={setAnchorLocation}
+              recommendations={advisorRecommendations}
+              onRecommendationsChange={setAdvisorRecommendations}
+              onListingFocus={focusAdvisorListing}
+            />
+          </div>
+        )}
+      </div>
+
       <footer className="site-footer">
-        <div><strong>SG HomeRadar</strong><span>NUS SWS3023 · Group 3</span></div>
+        <div><strong>SG HomeRadar</strong><span>NUS SWS3023 - Group 3</span></div>
         <p>Decision support from official transactions, partial market listings and aggregate neighbourhood evidence. Not a valuation or financial advice.</p>
       </footer>
+
+      {showOnboarding && (
+        <OnboardingTour
+          step={onboardingStep}
+          onStepChange={setOnboardingStep}
+          onClose={closeOnboarding}
+        />
+      )}
     </div>
   );
 }
@@ -381,33 +640,91 @@ function ExploreView({
   regions,
   selectedRegion,
   selectedProfile,
+  selectedComments,
+  listings,
+  redditAreaScores,
   setSelectedRegion,
   mapListingMode,
   setMapListingMode,
+  advisorMapListingIds,
+  clearAdvisorMapListings,
   regionScores,
   subzones,
   mapFilter,
-  chooseAreaForSearch,
   goRecommend,
   goAdvisor,
   anchorLocation,
+  focusedListingId,
+  setFocusedListingId,
 }: {
   status: ProductStatus | null;
   regions: Record<string, RegionProfile>;
   selectedRegion: SelectedRegion | null;
   selectedProfile: RegionProfile | SubzoneProfile | null;
+  selectedComments: DisplayComment[];
+  listings: RentalListing[];
+  redditAreaScores: RedditAreaNlp | null;
   setSelectedRegion: (value: SelectedRegion) => void;
   mapListingMode: 'none' | ListingMode;
   setMapListingMode: (value: 'none' | ListingMode) => void;
+  advisorMapListingIds: string[] | null;
+  clearAdvisorMapListings: () => void;
   regionScores: Record<string, number>;
   subzones: Record<string, SubzoneProfile>;
   mapFilter: (listing: RentalListing) => boolean;
-  chooseAreaForSearch: () => void;
   goRecommend: () => void;
   goAdvisor: () => void;
   anchorLocation: LocationAnchor | null;
+  focusedListingId: string | null;
+  setFocusedListingId: (value: string | null) => void;
 }) {
+  const [areaListingMode, setAreaListingMode] = useState<ListingMode>('sale');
   const profileIsRegion = selectedProfile && 'subzoneCount' in selectedProfile;
+  const selectedAreaListings = useMemo(() => {
+    if (!selectedRegion) return [];
+    return listings
+      .filter((listing) => {
+        if (listing.mode !== areaListingMode) return false;
+        if (!Number.isFinite(listing.latitude) || !Number.isFinite(listing.longitude)) return false;
+        if (selectedRegion.type === 'planning') return listing.planningArea === selectedRegion.id;
+        return listing.subzone === selectedRegion.id;
+      })
+      .sort((a, b) => Number(a.price ?? Number.MAX_SAFE_INTEGER) - Number(b.price ?? Number.MAX_SAFE_INTEGER));
+  }, [areaListingMode, listings, selectedRegion]);
+  const selectedAreaCounts = useMemo(() => {
+    if (!selectedRegion) return { sale: 0, rent: 0, total: 0 };
+    const areaListings = listings.filter((listing) => (
+      selectedRegion.type === 'planning'
+        ? listing.planningArea === selectedRegion.id
+        : listing.subzone === selectedRegion.id
+    ));
+    const sale = areaListings.filter((listing) => listing.mode === 'sale').length;
+    const rent = areaListings.filter((listing) => listing.mode === 'rent').length;
+    return { sale, rent, total: sale + rent };
+  }, [listings, selectedRegion]);
+
+  useEffect(() => {
+    if (!selectedRegion) return;
+    const preferredMode = selectedAreaCounts.sale ? 'sale' : 'rent';
+    setAreaListingMode(preferredMode);
+    setFocusedListingId(null);
+    clearAdvisorMapListings();
+    setMapListingMode(preferredMode);
+  }, [selectedRegion?.id]);
+
+  const setInlineListingMode = (mode: ListingMode) => {
+    setAreaListingMode(mode);
+    setFocusedListingId(null);
+    clearAdvisorMapListings();
+    setMapListingMode(mode);
+  };
+  const effectiveMapFilter = useMemo(() => {
+    return (listing: RentalListing) => {
+      if (!mapFilter(listing)) return false;
+      return focusedListingId ? listing.id === focusedListingId : true;
+    };
+  }, [focusedListingId, mapFilter]);
+
   return (
     <>
       <section className="hero-section">
@@ -416,14 +733,14 @@ function ExploreView({
           <h1>Find the neighbourhood<br />that fits <em>your life.</em></h1>
           <p className="hero-lede">Explore liveability across all 55 planning areas, then turn your needs into an explainable HDB shortlist grounded in real market evidence.</p>
           <div className="hero-actions">
-            <button className="button button--primary" onClick={goAdvisor}>Talk to your housing advisor <span>→</span></button>
-            <button className="button button--text" onClick={goRecommend}>I already know my filters →</button>
-            <a className="button button--text" href="#explore-map">Explore map ↓</a>
+            <button className="button button--primary" onClick={goAdvisor}>Talk to your housing advisor <span>&rarr;</span></button>
+            <button className="button button--text" onClick={goRecommend}>I already know my filters &rarr;</button>
+            <a className="button button--text" href="#explore-map">Explore map &rarr;</a>
           </div>
         </div>
         <div className="hero-proof" aria-label="Data coverage summary">
           <article><b>{status?.communityEvidence.planningAreas ?? 55}</b><span>planning areas</span><small>Complete boundary coverage</small></article>
-          <article><b>{compact.format(status?.historicalMarket.candidateRows ?? 7730)}</b><span>HDB candidates</span><small>24-month evidence windows</small></article>
+          <article><b>{compact.format(status?.historicalMarket.candidateRows ?? 7730)}</b><span>current HDB candidates</span><small>2-year results with 4-year comparison</small></article>
           <article><b>{compact.format((status?.liveListings.sale.rows ?? 6359) + (status?.liveListings.rent.rows ?? 8041))}</b><span>listing records</span><small>Partial research snapshot</small></article>
         </div>
       </section>
@@ -433,46 +750,64 @@ function ExploreView({
           <div><p className="overline">MACRO EXPLORATION</p><h2>Read Singapore at a glance.</h2></div>
           <p>Colour reflects an aggregate, reviews-backed liveability score. Click a planning area, then a subzone, to inspect the evidence behind it.</p>
         </div>
-        <div className="map-workspace">
+        <div className="map-workspace" data-tour="map">
           <div className="map-canvas">
-            <SingaporeMap
-              onSelect={setSelectedRegion}
-              listingsUrl="/live-listings.json"
-              listingFilter={mapFilter}
-              listingSort={(a, b) => (b.price ?? 0) - (a.price ?? 0)}
-              regionScores={regionScores}
-              subzoneScores={subzones}
-              maxListingMarkers={300}
-              anchorLocation={anchorLocation}
-              listingLabelMap={{
-                nearestMRT: 'Nearest MRT',
-                listedOn: 'Listed',
-                areaSqft: 'Floor area',
-                planningArea: 'Planning area',
-                subzone: 'Subzone',
-                locationSource: 'Location evidence',
-              }}
-            />
-            <div className="map-mode-control" role="group" aria-label="Map listing overlay">
-              <span>Overlay</span>
-              {(['none', 'sale', 'rent'] as const).map((mode) => (
-                <button key={mode} className={mapListingMode === mode ? 'active' : ''} onClick={() => setMapListingMode(mode)}>
-                  {mode === 'none' ? 'Areas' : mode === 'sale' ? 'For sale' : 'For rent'}
-                </button>
-              ))}
+            <div className="map-stage">
+              <SingaporeMap
+                onSelect={setSelectedRegion}
+                className={[
+                  advisorMapListingIds?.length ? 'sg-map--advisor-picks' : '',
+                  selectedRegion && mapListingMode !== 'none' ? 'sg-map--area-listings' : '',
+                  focusedListingId ? 'sg-map--single-listing' : '',
+                ].filter(Boolean).join(' ')}
+                listingsUrl="/live-listings.json"
+                listingFilter={effectiveMapFilter}
+                listingSort={(a, b) => (b.price ?? 0) - (a.price ?? 0)}
+                regionScores={regionScores}
+                subzoneScores={subzones}
+                maxListingMarkers={1000}
+                anchorLocation={anchorLocation}
+                focusedListingId={focusedListingId}
+                onFocusedListingClose={() => setFocusedListingId(null)}
+                listingLabelMap={{
+                  nearestMRT: 'Nearest MRT',
+                  listedOn: 'Listed',
+                  areaSqft: 'Floor area',
+                  planningArea: 'Planning area',
+                  subzone: 'Subzone',
+                  locationSource: 'Location evidence',
+                }}
+              />
+              <div className="map-mode-control" role="group" aria-label="Map listing overlay">
+                <span>Overlay</span>
+                {(['none', 'sale', 'rent'] as const).map((mode) => (
+                  <button key={mode} className={mapListingMode === mode ? 'active' : ''} onClick={() => { setFocusedListingId(null); clearAdvisorMapListings(); setMapListingMode(mode); }}>
+                    {mode === 'none' ? 'Areas' : mode === 'sale' ? 'For sale' : 'For rent'}
+                  </button>
+                ))}
+              </div>
+              {advisorMapListingIds?.length ? (
+                <div className="advisor-map-filter">
+                  <span>Advisor picks: {advisorMapListingIds.length}</span>
+                  <button type="button" onClick={clearAdvisorMapListings}>Show all {mapListingMode === 'sale' ? 'sale' : 'rent'} listings</button>
+                </div>
+              ) : null}
+              <div className="map-legend"><span><i className="legend-low" />Lower</span><b>Area rating</b><span>Higher<i className="legend-high" /></span></div>
+              <RedditScorePanel data={redditAreaScores} selectedRegion={selectedRegion} />
             </div>
-            <div className="map-legend"><span><i className="legend-low" />Lower</span><b>Liveability</b><span>Higher<i className="legend-high" /></span></div>
+            {selectedRegion && selectedProfile && (
+              <RegionComments comments={selectedComments} region={selectedRegion} className="map-comments" />
+            )}
           </div>
-          <aside className="region-panel">
+          <aside className="region-panel" data-tour="area-panel">
             {!selectedRegion || !selectedProfile ? (
               <div className="region-empty">
-                <span className="region-empty__mark">55</span>
                 <h3>Choose an area</h3>
-                <p>Click any planning area to see community scores, HDB market context and available listings.</p>
+                <p>Click any planning area to see mapped facilities, HDB market context and available listings.</p>
                 <div className="top-areas">
-                  {Object.values(regions).sort((a, b) => (b.liveabilityScore ?? 0) - (a.liveabilityScore ?? 0)).slice(0, 4).map((profile) => (
+                  {Object.values(regions).sort((a, b) => totalFacilities(b.facilityCounts) - totalFacilities(a.facilityCounts)).slice(0, 4).map((profile) => (
                     <button key={profile.name} onClick={() => setSelectedRegion({ id: profile.name, name: profile.name, type: 'planning' })}>
-                      <span>{titleCase(profile.name)}</span><b>{Math.round(profile.liveabilityScore ?? 0)}</b>
+                      <span>{titleCase(profile.name)}</span><b>{compact.format(totalFacilities(profile.facilityCounts))}</b>
                     </button>
                   ))}
                 </div>
@@ -480,10 +815,9 @@ function ExploreView({
             ) : (
               <div className="region-detail">
                 <div className="region-detail__top">
-                  <div><p className="overline">{selectedRegion.type === 'planning' ? 'PLANNING AREA' : `SUBZONE · ${titleCase(selectedRegion.parentId || '')}`}</p><h3>{titleCase(selectedRegion.name)}</h3></div>
-                  <ScoreRing score={selectedProfile.liveabilityScore} />
+                  <div><p className="overline">{selectedRegion.type === 'planning' ? 'PLANNING AREA' : `SUBZONE - ${titleCase(selectedRegion.parentId || '')}`}</p><h3>{titleCase(selectedRegion.name)}</h3></div>
                 </div>
-                <DimensionBars profile={selectedProfile} />
+                <CompactFacilitySummary profile={selectedProfile} />
                 {profileIsRegion && (
                   <>
                     <div className="region-facts">
@@ -495,13 +829,47 @@ function ExploreView({
                       <div className="market-note">
                         <span>Typical recent HDB resale</span>
                         <strong>{money.format((selectedProfile as RegionProfile).market!.medianHdbPrice)}</strong>
-                        <small>{compact.format((selectedProfile as RegionProfile).market!.recentTransactions)} recent transactions · through {(selectedProfile as RegionProfile).market!.latestTransactionMonth}</small>
+                        <small>{compact.format((selectedProfile as RegionProfile).market!.recentTransactions)} recent transactions - through {(selectedProfile as RegionProfile).market!.latestTransactionMonth}</small>
                       </div>
                     ) : <div className="market-note market-note--empty">Historical HDB comparison is not available for this planning area.</div>}
                   </>
                 )}
-                <button className="button button--primary button--wide" onClick={chooseAreaForSearch}>Find HDB options near here <span>→</span></button>
-                <p className="evidence-footnote">Scores aggregate place ratings and review evidence; raw review text and author information are not exposed.</p>
+                <div className="area-listing-block">
+                  <div className="area-listing-head">
+                    <div><p className="overline">HDB LISTINGS</p><h4>{compact.format(selectedAreaListings.length)} highlighted on the map</h4></div>
+                    <button type="button" onClick={goRecommend}>Refine</button>
+                  </div>
+                  <div className="area-listing-tabs" role="group" aria-label="Listing type">
+                    {(['sale', 'rent'] as const).map((mode) => (
+                      <button key={mode} className={areaListingMode === mode ? 'active' : ''} type="button" onClick={() => setInlineListingMode(mode)}>
+                        <span>{mode === 'sale' ? 'For sale' : 'For rent'}</span>
+                        <b>{compact.format(selectedAreaCounts[mode])}</b>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="area-listing-list">
+                    {selectedAreaListings.slice(0, 6).map((listing) => (
+                      <button
+                        key={listing.id}
+                        className={focusedListingId === listing.id ? 'active' : ''}
+                        type="button"
+                        onClick={() => setFocusedListingId(listing.id)}
+                      >
+                        <p>{listingPrice(listing)}</p>
+                        <h4>{listing.address || listing.title || 'HDB listing'}</h4>
+                        <span>{titleCase(listingLocation(listing))}</span>
+                        <div>
+                          {listing.areaSqft && <small>{Number(listing.areaSqft).toLocaleString()} sqft</small>}
+                          {listing.bedrooms && <small>{listing.bedrooms} BR</small>}
+                          {listing.nearestMRT && <small>{String(listing.nearestMRT).replace(/ MRT Station/i, '')}</small>}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  {!selectedAreaListings.length && <div className="area-listing-empty">No {areaListingMode === 'sale' ? 'sale' : 'rental'} listing is classified inside this area yet.</div>}
+                  <button className="button button--secondary button--wide" type="button" onClick={goRecommend}>Refine these listings <span>&rarr;</span></button>
+                </div>
+                <p className="evidence-footnote">Facility counts are mapped from public GeoJSON layers within each area; review-derived scores remain available only as background evidence.</p>
               </div>
             )}
           </aside>
@@ -512,25 +880,20 @@ function ExploreView({
 }
 
 function RecommendationView({
-  health,
   initialArea,
   anchorLocation,
   setAnchorLocation,
   onShowMap,
 }: {
-  health: Health | null;
   initialArea?: string;
   anchorLocation: LocationAnchor | null;
   setAnchorLocation: (value: LocationAnchor | null) => void;
   onShowMap: () => void;
 }) {
-  const [query, setQuery] = useState('A spacious 4-room flat under 650k, within 3 km of NUS and close to MRT.');
   const [budget, setBudget] = useState('650000');
   const [flatType, setFlatType] = useState('4 ROOM');
-  const [preferredTown, setPreferredTown] = useState(initialArea || '');
   const [topK, setTopK] = useState('8');
-  const [useLlm, setUseLlm] = useState(false);
-  const [locationQuery, setLocationQuery] = useState('');
+  const [locationQuery, setLocationQuery] = useState(initialArea || '');
   const [maxDistanceKm, setMaxDistanceKm] = useState('3');
   const [locationCandidates, setLocationCandidates] = useState<LocationCandidateResponse[]>([]);
   const [locationLoading, setLocationLoading] = useState(false);
@@ -540,13 +903,17 @@ function RecommendationView({
   const [compare, setCompare] = useState<string[]>([]);
 
   useEffect(() => {
-    if (initialArea) setPreferredTown(initialArea);
-  }, [initialArea]);
+    if (!initialArea) return;
+    setLocationQuery(initialArea);
+    setLocationCandidates([]);
+    setAnchorLocation(null);
+    setResult(null);
+  }, [initialArea, setAnchorLocation]);
 
   async function searchLocations(searchText = locationQuery): Promise<boolean> {
     const cleaned = searchText.trim();
     if (cleaned.length < 2) {
-      setError('Enter at least two characters, such as “NUS” or “VivoCity”.');
+      setError('Enter at least two characters, such as "NUS" or "VivoCity"');
       return false;
     }
     setError('');
@@ -557,7 +924,7 @@ function RecommendationView({
       if (!response.ok) throw new Error(data.message || 'OneMap location search is unavailable.');
       setLocationQuery(cleaned);
       setLocationCandidates(data.candidates || []);
-      if (!data.candidates?.length) setError(`OneMap found no Singapore location for “${cleaned}”. Try a fuller name or address.`);
+      if (!data.candidates?.length) setError(`OneMap found no Singapore location for "${cleaned}". Try a fuller name or address.`);
       return Boolean(data.candidates?.length);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'OneMap location search failed.');
@@ -600,8 +967,8 @@ function RecommendationView({
   async function submit(event: FormEvent) {
     event.preventDefault();
     setError('');
-    if (!query.trim() && !budget.trim()) {
-      setError('Add a budget in the brief or the budget field before searching.');
+    if (!budget.trim()) {
+      setError('Add a maximum budget before building the shortlist.');
       return;
     }
     if (locationQuery.trim() && !anchorLocation) {
@@ -613,14 +980,13 @@ function RecommendationView({
     setLoading(true);
     try {
       const payload: Record<string, unknown> = {
-        query: query.trim(),
+        query: '',
         top_k: Number(topK),
-        use_llm: useLlm,
+        use_llm: false,
       };
       if (budget) payload.budget = Number(budget);
       if (flatType) payload.flat_types = [flatType];
-      if (preferredTown) payload.preferred_towns = [preferredTown.toUpperCase()];
-      if (locationQuery) payload.location_query = locationQuery;
+      if (locationQuery && !anchorLocation) payload.location_query = locationQuery;
       if (anchorLocation) {
         payload.anchor_name = anchorLocation.name;
         payload.anchor_latitude = anchorLocation.latitude;
@@ -641,7 +1007,7 @@ function RecommendationView({
         setResult(null);
         setError(confirmation.location_candidates?.length
           ? 'Choose the intended OneMap result, then run the search again.'
-          : `OneMap found no Singapore location for “${confirmation.location_query}”.`);
+          : `OneMap found no Singapore location for "${confirmation.location_query}"`);
         return;
       }
       setResult(data as RecommendationResponse);
@@ -663,24 +1029,25 @@ function RecommendationView({
   return (
     <section className="recommend-section" id="recommendation">
       <div className="recommend-heading">
-        <div><p className="overline">MICRO RETRIEVAL</p><h1>Tell us what “home” means to you.</h1></div>
-        <p>Natural language becomes explicit constraints. Budget is never relaxed silently, and every result shows the evidence behind its rank.</p>
+        <div><p className="overline">MICRO RETRIEVAL</p><h1>Build a grounded HDB shortlist.</h1></div>
+        <p>Choose the essential constraints directly. Budget is never relaxed silently, and every result shows the evidence behind its rank.</p>
       </div>
       <div className="recommend-layout">
         <form className="brief-card" onSubmit={submit}>
-          <div className="brief-card__heading"><span>01</span><div><h2>Your housing brief</h2><p>Write naturally, then refine the essentials.</p></div></div>
-          <label htmlFor="homeBrief">What are you looking for?</label>
-          <textarea id="homeBrief" value={query} onChange={(event) => setQuery(event.target.value)} rows={5} placeholder="A 4-room HDB under 650k, ideally in Tampines…" />
+          <div className="brief-card__heading"><span>01</span><div><h2>Your search criteria</h2><p>Set the essentials, then verify a map anchor.</p></div></div>
           <div className="brief-grid">
             <label>Maximum budget<input type="number" min="50000" step="10000" value={budget} onChange={(event) => setBudget(event.target.value)} /></label>
             <label>Flat type<select value={flatType} onChange={(event) => setFlatType(event.target.value)}><option value="">Any HDB type</option>{['2 ROOM','3 ROOM','4 ROOM','5 ROOM','EXECUTIVE'].map((item) => <option key={item}>{item}</option>)}</select></label>
-            <label>Preferred town<input id="preferredTown" list="town-options" value={preferredTown} onChange={(event) => setPreferredTown(event.target.value)} /><datalist id="town-options">{(health?.towns || []).map((town) => <option key={town} value={town} />)}</datalist></label>
             <label>Shortlist size<select value={topK} onChange={(event) => setTopK(event.target.value)}><option value="5">Top 5</option><option value="8">Top 8</option><option value="12">Top 12</option></select></label>
+            <label className="radius-field brief-grid__radius">
+              Maximum straight-line distance
+              <span><input type="number" min="0.2" max="30" step="0.5" value={maxDistanceKm} onChange={(event) => updateMaxDistance(event.target.value)} /><i>km</i></span>
+            </label>
           </div>
           <div className="location-search">
             <div className="location-search__heading">
-              <span>Location anchor</span>
-              <small>Resolved privately by the server through OneMap</small>
+              <span>Specific place or address</span>
+              <small>Verified by OneMap before location filters are applied</small>
             </div>
             <div className="location-search__row">
               <input
@@ -694,7 +1061,7 @@ function RecommendationView({
                 placeholder="NUS, VivoCity, or a full address"
               />
               <button type="button" onClick={() => searchLocations()} disabled={locationLoading || locationQuery.trim().length < 2}>
-                {locationLoading ? 'Finding…' : 'Find'}
+                {locationLoading ? 'Finding...' : 'Find'}
               </button>
             </div>
             {locationCandidates.length > 0 && (
@@ -703,39 +1070,31 @@ function RecommendationView({
                 {locationCandidates.map((candidate) => (
                   <button type="button" key={candidate.id} onClick={() => chooseLocation(candidate)}>
                     <span><b>{candidate.name}</b><small>{candidate.address}</small></span>
-                    <em>{titleCase(candidate.subzone)} · {titleCase(candidate.planning_area)}</em>
+                    <em>{titleCase(candidate.subzone)} - {titleCase(candidate.planning_area)}</em>
                   </button>
                 ))}
               </div>
             )}
             {anchorLocation && (
               <div className="selected-location">
-                <span className="selected-location__pin">◎</span>
+                <span className="selected-location__pin">*</span>
                 <div>
                   <b>{anchorLocation.name}</b>
                   <small>{anchorLocation.address}</small>
-                  <em>{titleCase(anchorLocation.subzone)} · {titleCase(anchorLocation.planningArea)} · OneMap verified</em>
+                  <em>{titleCase(anchorLocation.subzone)} - {titleCase(anchorLocation.planningArea)} - OneMap verified</em>
                 </div>
                 <button type="button" onClick={onShowMap}>Map</button>
-                <button type="button" aria-label="Remove selected location" onClick={() => { setAnchorLocation(null); setLocationQuery(''); setResult(null); }}>×</button>
+                <button type="button" aria-label="Remove selected location" onClick={() => { setAnchorLocation(null); setLocationQuery(''); setResult(null); }}>x</button>
               </div>
             )}
-            <label className="radius-field">
-              Maximum straight-line distance
-              <span><input type="number" min="0.2" max="30" step="0.5" value={maxDistanceKm} onChange={(event) => updateMaxDistance(event.target.value)} /><i>km</i></span>
-            </label>
             <p className="location-search__note">The radius becomes a hard filter after you confirm a place. It is not walking or public-transport time.</p>
           </div>
           <div className="planned-fields" aria-label="Planned route feature">
-            <label>Maximum route travel time<input disabled placeholder="Route data required · coming soon" /></label>
+            <label>Maximum route travel time<input disabled placeholder="Route data required - coming soon" /></label>
           </div>
-          <label className={`ai-toggle ${health?.integrations?.openai ? '' : 'disabled'}`}>
-            <input type="checkbox" checked={useLlm} disabled={!health?.integrations?.openai} onChange={(event) => setUseLlm(event.target.checked)} />
-            <span><b>AI-assisted intent extraction</b><small>{health?.integrations?.openai ? 'Use the configured language model; deterministic filtering still controls the result.' : 'Not configured in this environment; rule parsing remains available.'}</small></span>
-          </label>
           {error && <p className="form-error">{error}</p>}
-          <button className="button button--primary button--wide" disabled={loading}>{loading ? 'Comparing evidence…' : 'Build my shortlist'}<span>→</span></button>
-          <p className="brief-assurance"><i /> Hard constraints stay hard · Missing evidence stays visible</p>
+          <button className="button button--primary button--wide" disabled={loading}>{loading ? 'Comparing evidence...' : 'Build my shortlist'}<span>&rarr;</span></button>
+          <p className="brief-assurance"><i /> Hard constraints stay hard - Missing evidence stays visible</p>
         </form>
 
         <div className="recommend-results" aria-live="polite">
@@ -757,9 +1116,9 @@ function RecommendationView({
               </div>
               {result.anchor_context && (
                 <div className="result-anchor">
-                  <span>◎</span>
-                  <p><b>Measured from {result.anchor_context.name || anchorLocation?.name || 'your selected place'}</b><small>{titleCase(result.anchor_context.subzone)} · straight-line distance</small></p>
-                  <button type="button" onClick={onShowMap}>View radius on map →</button>
+                  <span>*</span>
+                  <p><b>Measured from {result.anchor_context.name || anchorLocation?.name || 'your selected place'}</b><small>{titleCase(result.anchor_context.subzone)} - straight-line distance</small></p>
+                  <button type="button" onClick={onShowMap}>View radius on map &rarr;</button>
                 </div>
               )}
               {[...(result.intent.warnings || []), ...(result.warnings || [])].map((warning) => <p className="result-warning" key={warning}>{warning}</p>)}
@@ -791,8 +1150,7 @@ function RecommendationCard({ item, compared, compareFull, onCompare }: { item: 
     <article className="recommendation-card">
       <div className="recommendation-card__top">
         <span className="rank-badge">{String(item.rank).padStart(2, '0')}</span>
-        <div><h3>{item.block_address}</h3><p>{titleCase(item.town)} · {item.flat_type} · {item.flat_model}</p></div>
-        <ScoreRing score={item.ranking_score * 100} size="small" />
+        <div><h3>{item.block_address}</h3><p>{titleCase(item.town)} - {item.flat_type} - {item.flat_model}</p></div>
       </div>
       <div className="tag-row">
         {item.preferred_town_match && <span>Preferred area</span>}
@@ -802,15 +1160,15 @@ function RecommendationCard({ item, compared, compareFull, onCompare }: { item: 
       </div>
       <div className="recommendation-metrics">
         <article><small>Observed median</small><b>{money.format(item.median_resale_price)}</b></article>
-        <article><small>Middle 50%</small><b>{money.format(item.observed_price_low)}–{compact.format(item.observed_price_high)}</b></article>
-        <article><small>Typical size</small><b>{Math.round(item.median_floor_area_sqm)} m²</b></article>
+        <article><small>Middle 50%</small><b>{money.format(item.observed_price_low)}-{money.format(item.observed_price_high)}</b></article>
+        <article><small>Typical size</small><b>{Math.round(item.median_floor_area_sqm)} sqm</b></article>
         <article><small>Remaining lease</small><b>{item.median_remaining_lease_years.toFixed(1)} yrs</b></article>
         {item.anchor_distance_m != null && <article><small>Anchor distance</small><b>{(item.anchor_distance_m / 1000).toFixed(2)} km</b></article>}
       </div>
       <div className="evidence-line"><span style={{ width: `${item.evidence_coverage * 100}%` }} /></div>
       <p className="reason">{item.reasons[0]}</p>
       <div className="card-actions">
-        <button className={compared ? 'selected' : ''} disabled={!compared && compareFull} onClick={onCompare}>{compared ? 'Added to compare ✓' : 'Compare option'}</button>
+        <button className={compared ? 'selected' : ''} disabled={!compared && compareFull} onClick={onCompare}>{compared ? 'Added to compare' : 'Compare option'}</button>
         <details><summary>Why this ranked</summary><ul>{item.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></details>
       </div>
     </article>
@@ -822,16 +1180,16 @@ function CompareDrawer({ items, onClose }: { items: Recommendation[]; onClose: (
     ['Fit score', (item) => `${Math.round(item.ranking_score * 100)}/100`],
     ['Observed median', (item) => money.format(item.median_resale_price)],
     ['Budget reference', (item) => money.format(item.observed_price_high)],
-    ['Typical area', (item) => `${Math.round(item.median_floor_area_sqm)} m²`],
+    ['Typical area', (item) => `${Math.round(item.median_floor_area_sqm)} sqm`],
     ['Remaining lease', (item) => `${item.median_remaining_lease_years.toFixed(1)} years`],
     ['Evidence', (item) => `${item.recent_transaction_count} transactions`],
     ['Anchor distance', (item) => item.anchor_distance_m == null ? 'Not set' : `${(item.anchor_distance_m / 1000).toFixed(2)} km`],
   ];
   return (
     <div className="compare-drawer" role="dialog" aria-label="Compare shortlisted homes">
-      <div className="compare-drawer__head"><div><p className="overline">SIDE-BY-SIDE</p><h2>Compare {items.length} option{items.length > 1 ? 's' : ''}</h2></div><button onClick={onClose}>Close ×</button></div>
+      <div className="compare-drawer__head"><div><p className="overline">SIDE-BY-SIDE</p><h2>Compare {items.length} option{items.length > 1 ? 's' : ''}</h2></div><button onClick={onClose}>Close x</button></div>
       <div className="compare-table">
-        <div className="compare-row compare-row--head"><b>Evidence</b>{items.map((item) => <strong key={item.candidate_id}>{item.block_address}<small>{titleCase(item.town)} · {item.flat_type}</small></strong>)}</div>
+        <div className="compare-row compare-row--head"><b>Evidence</b>{items.map((item) => <strong key={item.candidate_id}>{item.block_address}<small>{titleCase(item.town)} - {item.flat_type}</small></strong>)}</div>
         {rows.map(([label, value]) => <div className="compare-row" key={label}><b>{label}</b>{items.map((item) => <span key={item.candidate_id}>{value(item)}</span>)}</div>)}
       </div>
     </div>
@@ -881,7 +1239,7 @@ function ListingsView({ listings, status }: { listings: RentalListing[]; status:
         <label><span>Maximum {mode === 'rent' ? 'monthly rent' : 'price'}</span><input type="number" value={maxPrice} onChange={(event) => setMaxPrice(event.target.value)} placeholder={mode === 'rent' ? '4000' : '800000'} /></label>
         <label className="located-toggle"><input type="checkbox" checked={locatedOnly} onChange={(event) => setLocatedOnly(event.target.checked)} /><span>Map-located only</span></label>
       </div>
-      <div className="listing-results-head"><p><b>{filtered.length.toLocaleString()}</b> matching listings</p><span>{coverage == null ? 'Location coverage unavailable' : `${Math.round((areaCoverage ?? coverage) * 100)}% area-classified · ${Math.round(coverage * 100)}% map-located`}</span></div>
+      <div className="listing-results-head"><p><b>{filtered.length.toLocaleString()}</b> matching listings</p><span>{coverage == null ? 'Location coverage unavailable' : `${Math.round((areaCoverage ?? coverage) * 100)}% area-classified - ${Math.round(coverage * 100)}% map-located`}</span></div>
       <div className="listing-grid">
         {filtered.slice(0, visible).map((listing) => <ListingCard key={listing.id} listing={listing} />)}
       </div>
@@ -915,7 +1273,7 @@ function ListingCard({ listing }: { listing: RentalListing }) {
           <small>{located
             ? `Map: ${String(listing.locationSource || 'listing coordinate').replaceAll('_', ' ')}`
             : listing.areaSource
-              ? `Area: ${String(listing.areaSource).replaceAll('_', ' ')} · map unresolved`
+              ? `Area: ${String(listing.areaSource).replaceAll('_', ' ')} - map unresolved`
               : 'Location unresolved'}</small>
         </footer>
       </div>
@@ -937,10 +1295,10 @@ function MethodView({ status }: { status: ProductStatus | null }) {
         ].map(([number, title, copy]) => <article key={number}><span>{number}</span><h2>{title}</h2><p>{copy}</p></article>)}
       </div>
       <div className="method-grid">
-        <article className="method-card method-card--dark"><p className="overline">PRICE MODEL</p><h2>Reference, never verdict.</h2><div className="model-numbers"><span><b>{status?.model.holdoutMapePercent ?? 5.9}%</b><small>holdout MAPE</small></span><span><b>{status?.model.holdoutR2 ?? 0.928}</b><small>holdout R²</small></span></div><p>A chronological test protects against training on the future. The prediction never overrides observed prices or budget filters.</p></article>
+        <article className="method-card method-card--dark"><p className="overline">PRICE MODEL</p><h2>Reference, never verdict.</h2><div className="model-numbers"><span><b>{status?.model.holdoutMapePercent ?? 5.9}%</b><small>holdout MAPE</small></span><span><b>{status?.model.holdoutR2 ?? 0.928}</b><small>holdout R2</small></span></div><p>A chronological test protects against training on the future. The prediction never overrides observed prices or budget filters.</p></article>
         <article className="method-card"><p className="overline">LIVEABILITY EVIDENCE</p><h2>Six dimensions, 332 subzones.</h2><div className="dimension-pills">{DIMENSIONS.map(([, label]) => <span key={label}>{label}</span>)}</div><p>Only aggregate place counts, ratings and review-derived signals reach the product. Raw review text and author data remain outside the public surface.</p></article>
       </div>
-      <div className="availability-section"><div><p className="overline">CAPABILITY BOUNDARY</p><h2>What is ready—and what is deliberately not faked.</h2></div><div className="availability-list"><article className="ready"><i />Explainable HDB recommendation<span>Available</span></article><article className="ready"><i />55-area and 332-subzone exploration<span>Available</span></article><article className="ready"><i />OneMap place search and distance radius<span>Available</span></article><article className="ready"><i />Partial sale and rental catalogue<span>Available</span></article>{(status?.unavailable || []).map((item) => <article key={item}><i />{item}<span>Planned</span></article>)}</div></div>
+      <div className="availability-section"><div><p className="overline">CAPABILITY BOUNDARY</p><h2>What is ready and what is deliberately not faked.</h2></div><div className="availability-list"><article className="ready"><i />Explainable HDB recommendation<span>Available</span></article><article className="ready"><i />55-area and 332-subzone exploration<span>Available</span></article><article className="ready"><i />OneMap place search and distance radius<span>Available</span></article><article className="ready"><i />Partial sale and rental catalogue<span>Available</span></article>{(status?.unavailable || []).map((item) => <article key={item}><i />{item}<span>Planned</span></article>)}</div></div>
       <div className="source-note"><h3>Data is evidence, not certainty.</h3><p>Listings can be removed or reordered after collection; community ratings reflect the contributed extract; straight-line distances are not walking routes. These limits stay visible instead of being converted into false precision.</p></div>
     </section>
   );
